@@ -156,14 +156,18 @@ fn run_claude(dir: &Path, args: Vec<OsString>) -> io::Result<i32> {
 }
 
 fn main() {
-    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+    else {
         eprintln!("claudin: HOME is not set");
         process::exit(1);
     };
 
     let stdin = io::stdin();
     let mut input = stdin.lock();
-    let mut out = io::stdout();
+    // UI goes to stderr so claude's stdout stays clean for pipelines.
+    let mut out = io::stderr();
     let name = match select_account(&home, &mut input, &mut out) {
         Ok(Some(name)) => name,
         Ok(None) => return,
@@ -179,7 +183,7 @@ fn main() {
         process::exit(1);
     }
 
-    println!("Using {CONFIG_ENV}={}", dir.display());
+    eprintln!("Using {CONFIG_ENV}={}", dir.display());
     match run_claude(&dir, env::args_os().skip(1).collect()) {
         Ok(code) => process::exit(code),
         Err(e) => {
