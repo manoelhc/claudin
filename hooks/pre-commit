@@ -1,0 +1,27 @@
+#!/bin/sh
+# Checks run before every commit: formatting, Clippy, and the test suite.
+# Enable in a fresh clone with:
+#   ln -sfn ../../hooks/pre-commit .git/hooks/pre-commit
+
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+
+if [ -n "${HOME:-}" ] && [ -d "$HOME/.cargo/bin" ]; then
+    PATH="$HOME/.cargo/bin:$PATH"
+    export PATH
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo is not on PATH" >&2
+    exit 1
+fi
+
+echo "pre-commit: cargo fmt"
+cargo fmt --all -- --check
+
+echo "pre-commit: cargo clippy"
+cargo clippy --all-targets -- -D warnings
+
+echo "pre-commit: cargo test"
+cargo test
