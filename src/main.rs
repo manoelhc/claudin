@@ -4,13 +4,14 @@
 //! `claudin` lists those directories in a menu. In a terminal, the user moves
 //! with the arrow keys and confirms with Enter (or creates a new account).
 //! `claudin` then launches `claude` with `CLAUDE_CONFIG_DIR` pointing to the
-//! selected directory. Inside Herdr (`HERDR_ENV=1`), the terminal app starts
-//! with a short prompt asking Claude to configure the Herdr workspace for
-//! that account. After the account is chosen, claudin asks whether to open
-//! the terminal app or the desktop app. A missing terminal app can be
-//! installed with the official script. A missing desktop app is installed
-//! by hand from the Claude Code download page. The desktop binary is
-//! `/Applications/Claude.app/Contents/MacOS/Claude` on macOS, or
+//! selected directory. `claudin --gui` opens a window for the same setup and
+//! starts the Claude desktop app. Inside Herdr (`HERDR_ENV=1`), the terminal
+//! app starts with a short prompt asking Claude to configure the Herdr
+//! workspace for that account. After the account is chosen, claudin asks
+//! whether to open the terminal app or the desktop app. A missing terminal
+//! app can be installed with the official script. A missing desktop app is
+//! installed by hand from the Claude Code download page. The desktop binary
+//! is `/Applications/Claude.app/Contents/MacOS/Claude` on macOS, or
 //! `%LOCALAPPDATA%\Anthropic\Claude\claude.exe` on Windows.
 
 use std::env;
@@ -19,6 +20,8 @@ use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
+
+mod gui;
 
 const PREFIX: &str = ".claude_";
 const CONFIG_ENV: &str = "CLAUDE_CONFIG_DIR";
@@ -576,6 +579,51 @@ fn program_on_path(name: &str) -> bool {
     })
 }
 
+struct LaunchRequest {
+    window: bool,
+    account: Option<String>,
+    claude_args: Vec<OsString>,
+}
+
+/// Splits `claudin` flags from arguments that are forwarded to Claude.
+/// `--` ends `claudin` flags. It is not forwarded. Everything after it is.
+fn parse_launch_args(args: Vec<OsString>) -> Result<LaunchRequest, String> {
+    let mut claude_args = args;
+    let mut forwarded = take_passthrough(&mut claude_args);
+    let window = take_gui_flag(&mut claude_args);
+    let account = take_account_arg(&mut claude_args)?;
+    claude_args.append(&mut forwarded);
+    Ok(LaunchRequest {
+        window,
+        account,
+        claude_args,
+    })
+}
+
+/// Removes the first `--` and returns every argument after it.
+fn take_passthrough(args: &mut Vec<OsString>) -> Vec<OsString> {
+    let Some(index) = args.iter().position(|arg| arg == "--") else {
+        return Vec::new();
+    };
+    let forwarded = args.split_off(index + 1);
+    args.pop();
+    forwarded
+}
+
+/// Removes a leading `--gui`, including `--account <name> --gui`.
+/// Later arguments stay in `args` and are forwarded to the desktop app.
+fn take_gui_flag(args: &mut Vec<OsString>) -> bool {
+    if args.first().is_some_and(|arg| arg == "--gui") {
+        args.remove(0);
+        return true;
+    }
+    if args.len() >= 3 && args[0] == "--account" && args[2] == "--gui" {
+        args.remove(2);
+        return true;
+    }
+    false
+}
+
 /// Removes a leading `--account <name>` so the menu can be skipped.
 /// Later arguments stay in `args` and are forwarded to `claude`.
 fn take_account_arg(args: &mut Vec<OsString>) -> Result<Option<String>, String> {
@@ -757,14 +805,24 @@ fn main() {
         process::exit(1);
     };
 
-    let mut claude_args: Vec<OsString> = env::args_os().skip(1).collect();
-    let preset = match take_account_arg(&mut claude_args) {
-        Ok(name) => name,
+    let LaunchRequest {
+        window: use_window,
+        account: preset,
+        claude_args,
+    } = match parse_launch_args(env::args_os().skip(1).collect()) {
+        Ok(request) => request,
         Err(message) => {
             eprintln!("claudin: {message}");
             process::exit(1);
         }
     };
+    if use_window {
+        if let Err(err) = gui::run(home, preset, claude_args) {
+            eprintln!("claudin: {err}");
+            process::exit(1);
+        }
+        return;
+    }
     // UI goes to stderr so claude's stdout stays clean for pipelines.
     let name = if let Some(name) = preset {
         Ok(Some(name))
@@ -1173,6 +1231,107 @@ mod tests {
         assert!(take_account_arg(&mut args).is_err());
         let mut args = vec![OsString::from("--account"), OsString::from("a/b")];
         assert!(take_account_arg(&mut args).is_err());
+    }
+
+    #[test]
+    fn gui_flag_opens_the_window_and_keeps_the_account() {
+        let mut args = vec![OsString::from("--gui")];
+        assert!(take_gui_flag(&mut args));
+        assert!(args.is_empty());
+
+        let mut args = vec![
+            OsString::from("--gui"),
+            OsString::from("--account"),
+            OsString::from("work"),
+            OsString::from("--resume"),
+        ];
+        assert!(take_gui_flag(&mut args));
+        assert_eq!(
+            take_account_arg(&mut args).unwrap().as_deref(),
+            Some("work")
+        );
+        assert_eq!(args, vec![OsString::from("--resume")]);
+
+        let mut args = vec![
+            OsString::from("--account"),
+            OsString::from("work"),
+            OsString::from("--gui"),
+        ];
+        assert!(take_gui_flag(&mut args));
+        assert_eq!(
+            take_account_arg(&mut args).unwrap().as_deref(),
+            Some("work")
+        );
+        assert!(args.is_empty());
+
+        let mut args = vec![OsString::from("--resume"), OsString::from("--gui")];
+        assert!(!take_gui_flag(&mut args));
+        assert_eq!(
+            args,
+            vec![OsString::from("--resume"), OsString::from("--gui")]
+        );
+    }
+
+    #[test]
+    fn double_dash_forwards_the_rest_unchanged() {
+        let request = parse_launch_args(vec![
+            OsString::from("--"),
+            OsString::from("--permission-mode=auto"),
+        ])
+        .unwrap();
+        assert!(!request.window);
+        assert!(request.account.is_none());
+        assert_eq!(
+            request.claude_args,
+            vec![OsString::from("--permission-mode=auto")]
+        );
+
+        let request = parse_launch_args(vec![
+            OsString::from("--account"),
+            OsString::from("work"),
+            OsString::from("--"),
+            OsString::from("--permission-mode=auto"),
+        ])
+        .unwrap();
+        assert_eq!(request.account.as_deref(), Some("work"));
+        assert_eq!(
+            request.claude_args,
+            vec![OsString::from("--permission-mode=auto")]
+        );
+
+        let request = parse_launch_args(vec![
+            OsString::from("--gui"),
+            OsString::from("--resume"),
+            OsString::from("--"),
+            OsString::from("--permission-mode=auto"),
+        ])
+        .unwrap();
+        assert!(request.window);
+        assert_eq!(
+            request.claude_args,
+            vec![
+                OsString::from("--resume"),
+                OsString::from("--permission-mode=auto")
+            ]
+        );
+
+        let request = parse_launch_args(vec![
+            OsString::from("--"),
+            OsString::from("--account"),
+            OsString::from("work"),
+            OsString::from("--gui"),
+        ])
+        .unwrap();
+        assert!(!request.window);
+        assert!(request.account.is_none());
+        assert_eq!(
+            request.claude_args,
+            vec![
+                OsString::from("--account"),
+                OsString::from("work"),
+                OsString::from("--gui"),
+            ]
+        );
     }
 
     #[test]
